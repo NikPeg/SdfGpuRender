@@ -459,7 +459,6 @@ class GPURayTracer:
 
                 # Основной цикл трассировки
                 for bounce in range(max_bounces):
-                    print(f"Bounce {bounce}, active rays: {torch.sum(flat_active_rays).item()}")
                     # Используем только активные лучи
                     active_indices = torch.where(flat_active_rays)[0]
 
@@ -482,9 +481,6 @@ class GPURayTracer:
                     # Определяем, какое пересечение ближе
                     hit_mesh_closer = hit_mesh & (~hit_plane | (t_mesh < t_plane))
                     hit_plane_closer = hit_plane & (~hit_mesh | (t_plane < t_mesh))
-
-                    print(f"Mesh hits: {torch.sum(hit_mesh).item()}, Plane hits: {torch.sum(hit_plane).item()}")
-                    print(f"Mesh closer: {torch.sum(hit_mesh_closer).item()}, Plane closer: {torch.sum(hit_plane_closer).item()}")
 
                     # Обрабатываем попадания в меш
                     if hit_mesh_closer.any():
@@ -549,20 +545,6 @@ class GPURayTracer:
                 # Очищаем кэш CUDA для освобождения памяти
                 torch.cuda.empty_cache()
 
-        for ty in range(0, height, tile_size):
-            for tx in range(0, width, tile_size):
-                th = min(tile_size, height - ty)
-                tw = min(tile_size, width - tx)
-
-                # Рисуем рамку вокруг тайла
-                if ty > 0:
-                    result[ty, tx:tx+tw] = [1.0, 0.0, 0.0]  # Красная верхняя граница
-                if ty+th < height:
-                    result[ty+th-1, tx:tx+tw] = [1.0, 0.0, 0.0]  # Красная нижняя граница
-                if tx > 0:
-                    result[ty:ty+th, tx] = [1.0, 0.0, 0.0]  # Красная левая граница
-                if tx+tw < width:
-                    result[ty:ty+th, tx+tw-1] = [1.0, 0.0, 0.0]  # Красная правая граница
         return result
 
     def render(self, camera, width, height, max_bounces=2):
