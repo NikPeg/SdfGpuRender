@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package raytracer;
+
+service RayTracer {
+  // Загрузка модели на сервер
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+
+  // Рендеринг с заданными параметрами камеры
+  rpc RenderFrame(RenderRequest) returns (RenderResponse);
+}
+
+message LoadModelRequest {
+  bytes model_data = 1;
+  string model_path = 2;
+}
+
+message LoadModelResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CameraParams {
+  repeated float position = 1;    // x, y, z
+  repeated float forward = 2;     // x, y, z
+  repeated float right = 3;       // x, y, z
+  repeated float up = 4;          // x, y, z
+  float fov = 5;                  // в радианах
+}
+
+message RenderRequest {
+  CameraParams camera = 1;
+  int32 width = 2;
+  int32 height = 3;
+  int32 max_bounces = 4;
+}
+
+message RenderResponse {
+  bool success = 1;
+  string message = 2;
+  bytes image_data = 3;
+  int32 width = 4;
+  int32 height = 5;
+}
