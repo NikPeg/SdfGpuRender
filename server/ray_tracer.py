@@ -219,7 +219,11 @@ def ray_triangle_intersect_batch(ray_origins, ray_directions, gpu_triangles, bat
             valid = valid & (t > 0.0)
 
             # Маскируем невалидные результаты
-            t_masked = torch.where(valid, t, torch.tensor(float('inf'), device=device))
+            t_masked = torch.where(
+                valid & torch.isfinite(t),
+                t,
+                torch.tensor(float('inf'), device=device)
+            )
 
             # Находим ближайшие пересечения для текущего батча треугольников
             batch_t, batch_idx = torch.min(t_masked, dim=1)
@@ -254,7 +258,7 @@ def ray_plane_intersect_batch(ray_origins, ray_directions, plane_normal, plane_d
 
     # Подготовка результирующих массивов
     hit = torch.zeros(num_rays, dtype=torch.bool, device=device)
-    t = torch.zeros(num_rays, dtype=torch.float32, device=device)
+    t = torch.ones(num_rays, dtype=torch.float32, device=device) * float('inf')
 
     # Обрабатываем лучи батчами
     for i in range(0, num_rays, batch_size):
@@ -268,14 +272,15 @@ def ray_plane_intersect_batch(ray_origins, ray_directions, plane_normal, plane_d
         # Проверка параллельности
         valid = torch.abs(denom) > 1e-6
 
-        # Вычисляем значения t
-        batch_t = torch.zeros_like(denom)
+        # Вычисляем значения t для валидных лучей
+        batch_t = torch.ones_like(denom) * float('inf')
         if valid.any():
             numer = -(torch.sum(plane_normal.unsqueeze(0) * batch_ray_o, dim=1) + plane_d)
-            batch_t[valid] = numer[valid] / denom[valid]
+            t_values = numer[valid] / denom[valid]
+            batch_t[valid] = t_values
 
         # Проверка на положительность t
-        batch_hit = valid & (batch_t > 0.0)
+        batch_hit = valid & (batch_t > 0.0) & (batch_t < float('inf'))
 
         # Сохраняем результаты для текущего батча
         hit[i:end] = batch_hit
@@ -398,8 +403,9 @@ class GPURayTracer:
         light_dir = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device=self.device)
         light_dir = light_dir / torch.norm(light_dir)
 
+        # Зеркальная плоскость (y = -1)
         plane_normal = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=self.device)
-        plane_d = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+        plane_d = torch.tensor(1.0, dtype=torch.float32, device=self.device)  # у = -1
 
         background_color = torch.tensor([0.2, 0.2, 0.3], dtype=torch.float32, device=self.device)
 
@@ -473,7 +479,7 @@ class GPURayTracer:
                         batch_ray_origins, batch_ray_directions, plane_normal, plane_d)
 
                     # Определяем, какое пересечение ближе
-                    hit_mesh_closer = hit_mesh & (~hit_plane | (t_mesh <= t_plane))
+                    hit_mesh_closer = hit_mesh & (~hit_plane | (t_mesh < t_plane))
                     hit_plane_closer = hit_plane & (~hit_mesh | (t_plane < t_mesh))
 
                     # Обрабатываем попадания в меш
