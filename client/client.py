@@ -223,8 +223,8 @@ def main(server_address, model_path):
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python client.py server_address model_path")
-        print("Example: python client.py localhost:50051 ../path/to/model.obj")
-        print("         python client.py localhost:50051 server:/path/on/server/model.obj")
+        print("Example: python client.py localhost:2230 ../path/to/model.obj")
+        print("         python client.py localhost:2230 server:/path/on/server/model.obj")
         sys.exit(1)
 
     server_address = sys.argv[1]
