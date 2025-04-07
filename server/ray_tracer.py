@@ -1,8 +1,44 @@
 import numpy as np
-import trimesh
 import torch
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+
+class GPUTriangles:
+    def __init__(self, mesh, device):
+        # Извлекаем данные треугольников
+        triangles = []
+        normals = []
+        edges1 = []
+        edges2 = []
+
+        for face in mesh.faces:
+            v0 = mesh.vertices[face[0]]
+            v1 = mesh.vertices[face[1]]
+            v2 = mesh.vertices[face[2]]
+
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            normal = np.cross(edge1, edge2)
+            normal_length = np.linalg.norm(normal)
+            if normal_length > 1e-10:
+                normal = normal / normal_length
+            else:
+                normal = np.array([0, 1, 0])  # Default normal
+
+            triangles.append([v0, v1, v2])
+            normals.append(normal)
+            edges1.append(edge1)
+            edges2.append(edge2)
+
+        # Преобразуем в тензоры PyTorch
+        self.triangles = torch.tensor(triangles, dtype=torch.float32, device=device)
+        self.normals = torch.tensor(normals, dtype=torch.float32, device=device)
+        self.edges1 = torch.tensor(edges1, dtype=torch.float32, device=device)
+        self.edges2 = torch.tensor(edges2, dtype=torch.float32, device=device)
+        self.v0 = self.triangles[:, 0]  # Первые вершины всех треугольников
+        self.v1 = self.triangles[:, 1]  # Вторые вершины всех треугольников
+        self.v2 = self.triangles[:, 2]  # Третьи вершины всех треугольников
+        self.num_triangles = len(triangles)
 
 @dataclass
 class Ray:
@@ -118,6 +154,89 @@ class BVH:
 
         return current_idx
 
+def ray_triangle_intersect_batch(ray_origins, ray_directions, gpu_triangles):
+    """Пакетное пересечение лучей с треугольниками на GPU"""
+    # Разворачиваем измерения для векторизации вычислений
+    num_rays = ray_origins.shape[0]
+    ray_o = ray_origins.unsqueeze(1)  # [num_rays, 1, 3]
+    ray_d = ray_directions.unsqueeze(1)  # [num_rays, 1, 3]
+
+    v0 = gpu_triangles.v0.unsqueeze(0)  # [1, num_triangles, 3]
+    edge1 = gpu_triangles.edges1.unsqueeze(0)  # [1, num_triangles, 3]
+    edge2 = gpu_triangles.edges2.unsqueeze(0)  # [1, num_triangles, 3]
+
+    # Вычисляем пересечения (алгоритм Möller–Trumbore)
+    h = torch.cross(ray_d, edge2, dim=-1)  # [num_rays, num_triangles, 3]
+    a = torch.sum(edge1 * h, dim=-1)  # [num_rays, num_triangles]
+
+    # Проверка на параллельность
+    valid = torch.abs(a) > 1e-6
+    if not valid.any():
+        return torch.zeros(num_rays, dtype=torch.bool, device=ray_origins.device), \
+            torch.zeros(num_rays, dtype=torch.float32, device=ray_origins.device), \
+            torch.zeros(num_rays, dtype=torch.int64, device=ray_origins.device), \
+            torch.zeros((num_rays, 3), dtype=torch.float32, device=ray_origins.device)
+
+    f = 1.0 / a
+    s = ray_o - v0
+    u = f * torch.sum(s * h, dim=-1)
+
+    # Проверка координат u
+    valid = valid & (u >= 0.0) & (u <= 1.0)
+
+    q = torch.cross(s, edge1, dim=-1)
+    v = f * torch.sum(ray_d * q, dim=-1)
+
+    # Проверка координат v
+    valid = valid & (v >= 0.0) & (u + v <= 1.0)
+
+    # Вычисляем значения t
+    t = f * torch.sum(edge2 * q, dim=-1)
+
+    # Проверка значений t
+    valid = valid & (t > 0.0)
+
+    # Маскируем недействительные пересечения
+    t = torch.where(valid, t, torch.tensor(float('inf'), device=ray_origins.device))
+
+    # Находим ближайшее пересечение для каждого луча
+    t_min, triangle_idx = torch.min(t, dim=1)
+
+    # Определяем, было ли пересечение
+    hit = t_min < float('inf')
+
+    # Получаем нормали в точках пересечения
+    normals = torch.zeros((num_rays, 3), dtype=torch.float32, device=ray_origins.device)
+    if hit.any():
+        normals[hit] = gpu_triangles.normals[triangle_idx[hit]]
+
+    return hit, t_min, triangle_idx, normals
+
+def ray_plane_intersect_batch(ray_origins, ray_directions, plane_normal, plane_d):
+    """Пакетное пересечение лучей с плоскостью на GPU"""
+    # Вычисляем знаменатель
+    denom = torch.sum(plane_normal.unsqueeze(0) * ray_directions, dim=1)  # [num_rays]
+
+    # Проверка параллельности
+    valid = torch.abs(denom) > 1e-6
+
+    # Вычисляем значения t
+    t = torch.zeros_like(denom)
+    if valid.any():
+        numer = -(torch.sum(plane_normal.unsqueeze(0) * ray_origins, dim=1) + plane_d)
+        t[valid] = numer[valid] / denom[valid]
+
+    # Проверка на положительность t
+    hit = valid & (t > 0.0)
+
+    return hit, t
+
+def reflect_ray_batch(ray_directions, normals):
+    """Пакетное отражение лучей на GPU"""
+    dot_product = torch.sum(ray_directions * normals, dim=1, keepdim=True)
+    reflected = ray_directions - 2.0 * dot_product * normals
+    return reflected
+
 def precompute_triangles(mesh) -> List[TriangleData]:
     triangles = []
     for face in mesh.faces:
@@ -178,22 +297,177 @@ class GPURayTracer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         self.mesh = None
-        self.bvh = None
-        self.triangles = None
+        self.gpu_triangles = None
+        self.bvh = None  # Оставляем для совместимости
+        self.triangles = None  # Оставляем для совместимости
 
     def load_model(self, mesh):
         self.mesh = mesh
 
-        # Построение BVH
-        print(f"Building BVH for mesh with {len(mesh.faces)} triangles...")
+        # Создаем GPU-представление треугольников вместо BVH
+        print(f"Building GPU triangles for mesh with {len(mesh.faces)} triangles...")
+        self.gpu_triangles = GPUTriangles(mesh, self.device)
+
+        # Оставляем старые структуры для совместимости
         self.bvh = BVH()
         self.bvh.build(mesh)
-
-        # Предварительное вычисление данных треугольников
         self.triangles = precompute_triangles(mesh)
+
         return True
 
+    def render_gpu(self, camera, width, height, max_bounces=2):
+        """Рендеринг сцены с использованием GPU"""
+        aspect = width / height
+        half_height = np.tan(camera['fov'] * 0.5)
+        half_width = aspect * half_height
+
+        # Преобразование параметров камеры в тензоры
+        cam_pos = torch.tensor(camera['pos'], dtype=torch.float32, device=self.device)
+        cam_forward = torch.tensor(camera['forward'], dtype=torch.float32, device=self.device)
+        cam_right = torch.tensor(camera['right'], dtype=torch.float32, device=self.device)
+        cam_up = torch.tensor(camera['up'], dtype=torch.float32, device=self.device)
+
+        # Определение параметров сцены
+        light_dir = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device=self.device)
+        light_dir = light_dir / torch.norm(light_dir)
+
+        plane_normal = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=self.device)
+        plane_d = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+
+        background_color = torch.tensor([0.2, 0.2, 0.3], dtype=torch.float32, device=self.device)
+
+        # Генерация координат пикселей
+        x_coords = torch.linspace(0, width - 1, width, device=self.device)
+        y_coords = torch.linspace(0, height - 1, height, device=self.device)
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+
+        # Преобразование координат пикселей в координаты изображения [-1, 1]
+        u = (2.0 * (xx + 0.5) / width - 1.0) * half_width
+        v = (1.0 - 2.0 * (yy + 0.5) / height) * half_height
+
+        # Создание направлений лучей
+        ray_directions = torch.zeros((height, width, 3), device=self.device)
+        ray_directions[..., 0] = u * cam_right[0] + v * cam_up[0] + cam_forward[0]
+        ray_directions[..., 1] = u * cam_right[1] + v * cam_up[1] + cam_forward[1]
+        ray_directions[..., 2] = u * cam_right[2] + v * cam_up[2] + cam_forward[2]
+
+        # Нормализация направлений
+        ray_norm = torch.norm(ray_directions, dim=-1, keepdim=True)
+        ray_directions = ray_directions / ray_norm
+
+        # Подготавливаем массивы для хранения результатов
+        ray_origins = cam_pos.expand(height, width, 3)
+        pixel_colors = torch.zeros((height, width, 3), device=self.device)
+        throughput = torch.ones((height, width, 3), device=self.device)
+
+        # Маска активных лучей
+        active_rays = torch.ones((height, width), dtype=torch.bool, device=self.device)
+
+        # Преобразуем массивы в 2D (один луч на пиксель)
+        flat_ray_origins = ray_origins.reshape(-1, 3)
+        flat_ray_directions = ray_directions.reshape(-1, 3)
+        flat_throughput = throughput.reshape(-1, 3)
+        flat_active_rays = active_rays.reshape(-1)
+        flat_pixel_colors = pixel_colors.reshape(-1, 3)
+
+        # Основной цикл трассировки
+        for bounce in range(max_bounces):
+            # Используем только активные лучи
+            active_indices = torch.where(flat_active_rays)[0]
+
+            if active_indices.shape[0] == 0:
+                break
+
+            # Выбираем только активные лучи для вычислений
+            batch_ray_origins = flat_ray_origins[active_indices]
+            batch_ray_directions = flat_ray_directions[active_indices]
+            batch_throughput = flat_throughput[active_indices]
+
+            # Пересечение с мешем
+            hit_mesh, t_mesh, triangle_idx, normals = ray_triangle_intersect_batch(
+                batch_ray_origins, batch_ray_directions, self.gpu_triangles)
+
+            # Пересечение с плоскостью
+            hit_plane, t_plane = ray_plane_intersect_batch(
+                batch_ray_origins, batch_ray_directions, plane_normal, plane_d)
+
+            # Определяем, какие пересечения ближе
+            hit_mesh_closer = hit_mesh & (~hit_plane | (t_mesh <= t_plane))
+            hit_plane_closer = hit_plane & (~hit_mesh | (t_plane < t_mesh))
+
+            # Обрабатываем попадания в меш
+            if hit_mesh_closer.any():
+                # Индексы для лучей, попавших в меш
+                mesh_hit_indices = active_indices[hit_mesh_closer]
+
+                # Вычисляем точки пересечения
+                hit_points = batch_ray_origins[hit_mesh_closer] + batch_ray_directions[hit_mesh_closer] * t_mesh[hit_mesh_closer].unsqueeze(1)
+
+                # Вычисляем освещение
+                mesh_normals = normals[hit_mesh_closer]
+                dot_product = torch.sum(mesh_normals * light_dir.unsqueeze(0), dim=1).clamp(min=0.0)
+                diffuse_color = torch.tensor([0.8, 0.8, 0.8], device=self.device).unsqueeze(0)
+                ambient_color = torch.tensor([0.1, 0.1, 0.1], device=self.device).unsqueeze(0)
+
+                # Вычисляем цвет
+                hit_colors = batch_throughput[hit_mesh_closer] * (diffuse_color * dot_product.unsqueeze(1) + ambient_color)
+
+                # Обновляем цвета попаданий
+                flat_pixel_colors[mesh_hit_indices] += hit_colors
+
+                # Деактивируем лучи, попавшие в меш
+                flat_active_rays[mesh_hit_indices] = False
+
+            # Обрабатываем попадания в плоскость
+            if hit_plane_closer.any():
+                # Индексы для лучей, попавших в плоскость
+                plane_hit_indices = active_indices[hit_plane_closer]
+
+                # Вычисляем точки пересечения
+                hit_points = batch_ray_origins[hit_plane_closer] + batch_ray_directions[hit_plane_closer] * t_plane[hit_plane_closer].unsqueeze(1)
+
+                # Вычисляем отраженные лучи
+                reflected_directions = reflect_ray_batch(
+                    batch_ray_directions[hit_plane_closer],
+                    plane_normal.expand(hit_plane_closer.sum(), 3)
+                )
+
+                # Обновляем лучи для следующего отскока
+                offset_points = hit_points + 0.001 * plane_normal.unsqueeze(0)
+                flat_ray_origins[plane_hit_indices] = offset_points
+                flat_ray_directions[plane_hit_indices] = reflected_directions
+
+                # Уменьшаем throughput для отраженных лучей
+                flat_throughput[plane_hit_indices] *= 0.8
+
+            # Обрабатываем промахи
+            missed = ~(hit_mesh_closer | hit_plane_closer)
+            if missed.any():
+                miss_indices = active_indices[missed]
+
+                # Добавляем цвет фона
+                flat_pixel_colors[miss_indices] += flat_throughput[miss_indices] * background_color
+
+                # Деактивируем лучи, которые промахнулись
+                flat_active_rays[miss_indices] = False
+
+        # Преобразуем результаты обратно в формат изображения
+        pixel_colors = flat_pixel_colors.reshape(height, width, 3)
+
+        # Передаем результат на CPU для возврата
+        return pixel_colors.cpu().numpy().clip(0, 1)
+
     def render(self, camera, width, height, max_bounces=2):
+        # Используем GPU-рендеринг вместо CPU-версии
+        if str(self.device) != "cpu":
+            print("Using GPU accelerated rendering")
+            return self.render_gpu(camera, width, height, max_bounces)
+        else:
+            print("Using CPU rendering (No GPU available)")
+            # Вызываем оригинальный CPU метод
+            return self.render_cpu(camera, width, height, max_bounces)
+
+    def render_cpu(self, camera, width, height, max_bounces=2):
         # Настройка параметров рендеринга
         aspect = width / height
         half_height = np.tan(camera['fov'] * 0.5)
